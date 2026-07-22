@@ -1,0 +1,9 @@
+# Build output
+*.exe
+*.o
+*.obj
+build/
+bin/
+
+# Generated Binary Test Feeds
+*.itch
