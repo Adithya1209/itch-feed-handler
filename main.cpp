@@ -1,5 +1,6 @@
 #include "itch_types.h"
 #include "itch_utils.h"
+#include "order_book.h"
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -12,19 +13,22 @@ constexpr bool VERBOSE = false;
 // Fixed 2D array of 65,536 entries storing raw 8-byte symbol blocks (Zero Heap Allocations)
 char symbol_map[65536][9]; 
 
+// Array of OrderBook engines (one for every possible stock locate ID)
+OrderBook books[65536];
+
 int main() {
     // For faster I/O
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
     // Open ITCH file in binary mode
-    std::ifstream file("simulated_market.itch", std::ios::binary);
+    std::ifstream file("real_sample.itch", std::ios::binary);
     if (!file) {
         std::cerr << "Failed to open binary file. Make sure it exists in the working directory.\n";
         return 1;
     }
 
-    std::cout << "Starting ITCH 5.0 Feed Parser\n";
+    std::cout << "Starting ITCH 5.0 Feed Parser (REAL NASDAQ SESSION: DEC 30, 2019)\n";
     
     std::uint16_t raw_length = 0;
     size_t processed_count = 0;
@@ -100,8 +104,11 @@ int main() {
                 uint64_t ns = parse_timestamp48(msg->timestamp);
                 uint64_t order_ref = bswap64(msg->order_ref_num);
                 uint32_t shares = bswap32(msg->shares);
-                double price = bswap32(msg->price) / 10000.0;
+                uint32_t raw_price = bswap32(msg->price);
+                double price = raw_price / 10000.0;
                 total_volume_traded += shares;
+
+                books[stock_locate].add_order(order_ref, msg->buy_sell_indicator, shares, raw_price, stock_locate);
 
                 if (VERBOSE) {
                     std::string symbol = clean_symbol(msg->stock, 8);
@@ -129,6 +136,8 @@ int main() {
                 uint64_t match_num = bswap64(msg->match_number);
                 total_volume_traded += exec_shares;
 
+                books[stock_locate].execute_order(order_ref, exec_shares);
+
                 if (VERBOSE) {
                     std::cout << "[Executed]     "
                               << "Locate: " << std::setw(5) << stock_locate
@@ -151,6 +160,8 @@ int main() {
                 uint64_t order_ref = bswap64(msg->order_ref_num);
                 uint32_t cancel_shares = bswap32(msg->cancelled_shares);
 
+                books[stock_locate].cancel_order(order_ref, cancel_shares);
+
                 if (VERBOSE) {
                     std::cout << "[Cancel]       "
                               << "Locate: " << std::setw(5) << stock_locate
@@ -170,6 +181,8 @@ int main() {
                 uint16_t tracking_num = bswap16(msg->tracking_number);
                 uint64_t ns = parse_timestamp48(msg->timestamp);
                 uint64_t order_ref = bswap64(msg->order_ref_num);
+
+                books[stock_locate].delete_order(order_ref);
 
                 if (VERBOSE) {
                     std::cout << "[Delete]       "
@@ -191,7 +204,10 @@ int main() {
                 uint64_t orig_ref = bswap64(msg->original_order_ref_num);
                 uint64_t new_ref = bswap64(msg->new_order_ref_num);
                 uint32_t shares = bswap32(msg->shares);
-                double price = bswap32(msg->price) / 10000.0;
+                uint32_t raw_price = bswap32(msg->price);
+                double price = raw_price / 10000.0;
+
+                books[stock_locate].replace_order(orig_ref, new_ref, shares, raw_price);
 
                 if (VERBOSE) {
                     std::cout << "[Replace]      "
@@ -220,6 +236,23 @@ int main() {
     std::cout << "Total Volume Processed: " << total_volume_traded << " shares\n";
     std::cout << "Processed " << processed_count << " messages in " << elapsed_sec << " seconds.\n";
     std::cout << "True Field-Decoding Throughput: " << static_cast<uint64_t>(processed_count / elapsed_sec) << " msg/sec\n";
+    std::cout << "=========================================================================\n";
+
+    std::cout << "=========================================================================\n";
+    std::cout << "REAL MARKET TOP-OF-BOOK (BBO) STATE (DEC 30, 2019 SAMPLES)\n";
+    std::cout << "=========================================================================\n";
+
+    size_t printed_stocks = 0;
+    for (uint16_t loc = 1; loc < 65536; loc++) {
+        if (books[loc].get_best_bid() > 0 || books[loc].get_best_ask() > 0) {
+            std::cout << "Stock: " << std::setw(8) << symbol_map[loc] << " (Locate " << std::setw(4) << loc << ") | ";
+            books[loc].print_bbo();
+            printed_stocks++;
+            if (printed_stocks >= 15) {
+                break; // Top 15 active real stocks
+            }
+        }
+    }
     std::cout << "=========================================================================\n";
 
     return 0;
