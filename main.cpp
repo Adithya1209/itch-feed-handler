@@ -1,3 +1,4 @@
+ #include "mapped_file.h"
 #include "itch_types.h"
 #include "itch_utils.h"
 #include "order_book.h"
@@ -21,12 +22,19 @@ int main() {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    // Open ITCH file in binary mode
-    std::ifstream file("real_sample.itch", std::ios::binary);
-    if (!file) {
-        std::cerr << "Failed to open binary file. Make sure it exists in the working directory.\n";
-        return 1;
-    }
+    // Open ITCH file in binary mode (ifstream)
+    // std::ifstream file("real_sample.itch", std::ios::binary);
+    // if (!file) {
+    //     std::cerr << "Failed to open binary file. Make sure it exists in the working directory.\n";
+    //     return 1;
+    // }
+
+    // Open ITCH file using Memory-Mapped I/O
+    MappedFile file("real_sample.itch");
+
+    const uint8_t* ptr = file.data();
+    const uint8_t* end = file.data() + file.size();
+
 
     std::cout << "Starting ITCH 5.0 Feed Parser (REAL NASDAQ SESSION: DEC 30, 2019)\n";
     
@@ -42,24 +50,20 @@ int main() {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // Loop and read the 2-byte length prefix until EOF
-    while (file.read(reinterpret_cast<char*>(&raw_length), sizeof(raw_length))) {
-        
-        // Convert Big-Endian length prefix to host byte order (Little-Endian)
-        std::uint16_t msg_length = bswap16(raw_length);
-        
-        if (msg_length == 0 || msg_length > sizeof(buffer)) {
-            continue;
-        }
+    while (ptr + 2 <= end) {
+        uint16_t raw_length = 0;
+        std::memcpy(&raw_length, ptr, sizeof(raw_length));
 
-        // Read payload directly into our fixed stack buffer
-        if (!file.read(buffer, msg_length)) {
-            std::cerr << "Error: Premature end of file while reading message payload.\n";
-            break;
-        }
+        uint16_t msg_length = bswap16(raw_length);
+        ptr += 2;
 
-        // Identify Message Type (first byte of payload)
+        if(msg_length ==0 || ptr + msg_length > end) break;
+
+        // Zero copy pointer directly into mapped memory
+        const char* buffer = reinterpret_cast<const char*>(ptr);
         char message_type = buffer[0];
         processed_count++;
+
 
         switch (message_type) {
 
@@ -226,6 +230,7 @@ int main() {
             default:
                 break;
         }
+        ptr += msg_length;
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
