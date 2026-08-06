@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <cstring>
 
 // INLINE UTILITIES (Declared inline in the header for compiler optimizations)
 
@@ -30,22 +31,15 @@ inline uint64_t bswap64(uint64_t val) {
 
 // Reconstructs a 6-byte Big-Endian timestamp into a standard 64-bit integer
 inline uint64_t parse_timestamp48(const uint8_t* bytes) {
-    return (static_cast<uint64_t>(bytes[0]) << 40) |
-           (static_cast<uint64_t>(bytes[1]) << 32) |
-           (static_cast<uint64_t>(bytes[2]) << 24) |
-           (static_cast<uint64_t>(bytes[3]) << 16) |
-           (static_cast<uint64_t>(bytes[4]) << 8)  |
-           (static_cast<uint64_t>(bytes[5]));
+    uint64_t val = 0;
+    std:: memcpy(&val, bytes, 6);
+    return bswap64(val) >> 16;
 }
 
 // Converts a 64-bit timestamp into a 6-byte Big-Endian representation
 inline void pack_timestamp48(uint64_t ns, uint8_t* dest) {
-    dest[0] = static_cast<uint8_t>((ns >> 40) & 0xFF);
-    dest[1] = static_cast<uint8_t>((ns >> 32) & 0xFF);
-    dest[2] = static_cast<uint8_t>((ns >> 24) & 0xFF);
-    dest[3] = static_cast<uint8_t>((ns >> 16) & 0xFF);
-    dest[4] = static_cast<uint8_t>((ns >> 8)  & 0xFF);
-    dest[5] = static_cast<uint8_t>(ns & 0xFF);
+    uint64_t swapped = bswap64(ns << 16);
+    std:: memcpy(dest, &swapped, 6);
 }
 
 // FUNCTION DECLARATIONS (Implementations in itch_utils.cpp)
