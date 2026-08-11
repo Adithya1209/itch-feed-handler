@@ -9,6 +9,14 @@ OrderBook:: OrderBook(): num_bids_(0), num_asks_(0){
 }
 
 void OrderBook::add_bid_volume(uint32_t price, uint32_t shares) {
+    // Clean any crossed ask levels executed in exchange trades
+    while (num_asks_ > 0 && price >= asks_[0].price) {
+        for (size_t j = 0; j < num_asks_ - 1; ++j) {
+            asks_[j] = asks_[j + 1];
+        }
+        num_asks_--;
+    }
+
     for(size_t i=0; i<num_bids_; ++i){
         if(bids_[i].price == price){
             bids_[i].volume += shares;
@@ -44,6 +52,14 @@ void OrderBook::remove_bid_volume(uint32_t price, uint32_t shares) {
 }
 
 void OrderBook::add_ask_volume(uint32_t price, uint32_t shares) {
+    // Clean any crossed bid levels executed in exchange trades
+    while (num_bids_ > 0 && price <= bids_[0].price) {
+        for (size_t j = 0; j < num_bids_ - 1; ++j) {
+            bids_[j] = bids_[j + 1];
+        }
+        num_bids_--;
+    }
+
     for(size_t i=0; i<num_asks_; ++i){
         if(asks_[i].price == price){
             asks_[i].volume += shares;
@@ -82,10 +98,8 @@ void OrderBook::remove_ask_volume(uint32_t price, uint32_t shares) {
 void OrderBook::add_order(uint64_t ref_num, char side, uint32_t shares, uint32_t price, uint16_t locate) {
 
     size_t idx = ref_num & (MAX_ORDERS - 1);
-    size_t probes = 0;
-    while (orders_[idx].active && orders_[idx].order_ref_num != ref_num && probes < 8) {
+    while (orders_[idx].active && orders_[idx].order_ref_num != ref_num) {
         idx = (idx + 1) & (MAX_ORDERS - 1);
-        probes++;
     }
 
     orders_[idx] = Order{ref_num, side, shares, price, locate, true};  
@@ -100,10 +114,8 @@ void OrderBook::add_order(uint64_t ref_num, char side, uint32_t shares, uint32_t
 void OrderBook::execute_order(uint64_t ref_num, uint32_t exec_shares) {
     
     size_t idx = ref_num & (MAX_ORDERS - 1);
-    size_t probes = 0;
-    while (orders_[idx].active && orders_[idx].order_ref_num != ref_num && probes < 8) {
+    while (orders_[idx].active && orders_[idx].order_ref_num != ref_num) {
         idx = (idx + 1) & (MAX_ORDERS - 1);
-        probes++;
     }
     
     Order& order = orders_[idx];
@@ -129,10 +141,8 @@ void OrderBook::cancel_order(uint64_t ref_num, uint32_t cancel_shares) {
 
 void OrderBook::delete_order(uint64_t ref_num) {
     size_t idx = ref_num & (MAX_ORDERS - 1);
-    size_t probes = 0;
-    while (orders_[idx].active && orders_[idx].order_ref_num != ref_num && probes < 8) {
+    while (orders_[idx].active && orders_[idx].order_ref_num != ref_num) {
         idx = (idx + 1) & (MAX_ORDERS - 1);
-        probes++;
     }
     Order& order = orders_[idx];
     if(!order.active || order.order_ref_num != ref_num) return;
@@ -148,10 +158,8 @@ void OrderBook::delete_order(uint64_t ref_num) {
 void OrderBook::replace_order(uint64_t orig_ref_num, uint64_t new_ref_num, uint32_t new_shares, uint32_t new_price) {
 
     size_t idx = orig_ref_num & (MAX_ORDERS - 1);
-    size_t probes = 0;
-    while (orders_[idx].active && orders_[idx].order_ref_num != orig_ref_num && probes < 8) {
+    while (orders_[idx].active && orders_[idx].order_ref_num != orig_ref_num) {
         idx = (idx + 1) & (MAX_ORDERS - 1);
-        probes++;
     }
 
     if(!orders_[idx].active || orders_[idx].order_ref_num != orig_ref_num) return;
