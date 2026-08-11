@@ -1,4 +1,4 @@
- #include "mapped_file.h"
+#include "mapped_file.h"
 #include "itch_types.h"
 #include "itch_utils.h"
 #include "order_book.h"
@@ -15,7 +15,15 @@ constexpr bool VERBOSE = false;
 char symbol_map[65536][9]; 
 
 // Array of OrderBook engines (one for every possible stock locate ID)
-OrderBook books[65536];
+OrderBook* books[65536] = {nullptr};
+
+// Lazy Allocation Helper Function: Instantiate OrderBook ONLY if this is the first order for this stock
+inline OrderBook* get_or_create_book(uint16_t locate) {
+    if (!books[locate]) {
+        books[locate] = new OrderBook();
+    }
+    return books[locate];
+}
 
 int main() {
     // For faster I/O
@@ -112,7 +120,7 @@ int main() {
                 double price = raw_price / 10000.0;
                 total_volume_traded += shares;
 
-                books[stock_locate].add_order(order_ref, msg->buy_sell_indicator, shares, raw_price, stock_locate);
+                get_or_create_book(stock_locate)->add_order(order_ref, msg->buy_sell_indicator, shares, raw_price, stock_locate);
 
                 if (VERBOSE) {
                     std::string symbol = clean_symbol(msg->stock, 8);
@@ -140,7 +148,7 @@ int main() {
                 uint64_t match_num = bswap64(msg->match_number);
                 total_volume_traded += exec_shares;
 
-                books[stock_locate].execute_order(order_ref, exec_shares);
+                get_or_create_book(stock_locate)->execute_order(order_ref, exec_shares);
 
                 if (VERBOSE) {
                     std::cout << "[Executed]     "
@@ -164,7 +172,7 @@ int main() {
                 uint64_t order_ref = bswap64(msg->order_ref_num);
                 uint32_t cancel_shares = bswap32(msg->cancelled_shares);
 
-                books[stock_locate].cancel_order(order_ref, cancel_shares);
+                get_or_create_book(stock_locate)->cancel_order(order_ref, cancel_shares);
 
                 if (VERBOSE) {
                     std::cout << "[Cancel]       "
@@ -186,7 +194,7 @@ int main() {
                 uint64_t ns = parse_timestamp48(msg->timestamp);
                 uint64_t order_ref = bswap64(msg->order_ref_num);
 
-                books[stock_locate].delete_order(order_ref);
+                get_or_create_book(stock_locate)->delete_order(order_ref);
 
                 if (VERBOSE) {
                     std::cout << "[Delete]       "
@@ -211,7 +219,7 @@ int main() {
                 uint32_t raw_price = bswap32(msg->price);
                 double price = raw_price / 10000.0;
 
-                books[stock_locate].replace_order(orig_ref, new_ref, shares, raw_price);
+                get_or_create_book(stock_locate)->replace_order(orig_ref, new_ref, shares, raw_price);
 
                 if (VERBOSE) {
                     std::cout << "[Replace]      "
@@ -249,9 +257,9 @@ int main() {
 
     size_t printed_stocks = 0;
     for (uint16_t loc = 1; loc < 65536; loc++) {
-        if (books[loc].get_best_bid() > 0 || books[loc].get_best_ask() > 0) {
+        if (books[loc] && (books[loc]->get_best_bid() > 0 || books[loc]->get_best_ask() > 0)) {
             std::cout << "Stock: " << std::setw(8) << symbol_map[loc] << " (Locate " << std::setw(4) << loc << ") | ";
-            books[loc].print_bbo();
+            books[loc]->print_bbo();
             printed_stocks++;
             if (printed_stocks >= 15) {
                 break; // Top 15 active real stocks
