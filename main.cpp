@@ -1,3 +1,4 @@
+#include <omp.h>
 #include "mapped_file.h"
 #include "itch_types.h"
 #include "itch_utils.h"
@@ -40,9 +41,6 @@ int main() {
     // Open ITCH file using Memory-Mapped I/O
     MappedFile file("real_sample.itch");
 
-    const uint8_t* ptr = file.data();
-    const uint8_t* end = file.data() + file.size();
-
 
     std::cout << "Starting ITCH 5.0 Feed Parser (REAL NASDAQ SESSION: DEC 30, 2019)\n";
     
@@ -57,191 +55,229 @@ int main() {
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Loop and read the 2-byte length prefix until EOF
-    while (ptr + 2 <= end) {
-        uint16_t raw_length = 0;
-        std::memcpy(&raw_length, ptr, sizeof(raw_length));
+    #pragma omp parallel num_threads(12)
+    {
+        int thread_id = omp_get_thread_num();
+        int num_threads = omp_get_num_threads();
 
-        uint16_t msg_length = bswap16(raw_length);
-        ptr += 2;
+        size_t file_size = file.size();
+        size_t chunk_size = file_size / num_threads;
 
-        if(msg_length ==0 || ptr + msg_length > end) break;
+        const size_t start_offset = chunk_size * thread_id;
+        const size_t end_offset = (thread_id == num_threads - 1) ? file_size : (thread_id + 1) * chunk_size;
 
-        // Zero copy pointer directly into mapped memory
-        const char* buffer = reinterpret_cast<const char*>(ptr);
-        char message_type = buffer[0];
-        processed_count++;
+        const uint8_t* ptr = file.data() + start_offset;
+        const uint8_t* end_ptr = file.data() + end_offset;
+        const uint8_t* total_file_end = file.data() + file_size;
 
+        if (thread_id > 0) {
+            while (ptr + 3 <= end_ptr) {
+                uint16_t raw_length = 0;
+                std::memcpy(&raw_length, ptr, sizeof(raw_length));
+                uint16_t msg_len = bswap16(raw_length);
+                char msg_type = static_cast<char>(ptr[2]);
 
-        switch (message_type) {
-
-            // Stock Directory Message
-            case 'R': [[unlikely]] {
-                const auto* msg = reinterpret_cast<const StockDirectoryMessage*>(buffer);
-                uint16_t locate = bswap16(msg->stock_locate);
-                std::memcpy(symbol_map[locate], msg->stock, 8);
-                symbol_map[locate][8] = '\0'; // Null-terminate for string safety
-
-                if (VERBOSE) {
-                    uint32_t lot_size = bswap32(msg->round_lot_size);
-                    std::cout << "[Stock Directory] Locate: " << std::setw(5) << locate
-                              << " | Symbol: " << std::setw(8) << symbol_map[locate]
-                              << " | Lot Size: " << lot_size << "\n";
+                // Check if length is between 12 and 50 AND byte[2] is a valid ITCH message type
+                if (msg_len >= 12 && msg_len <= 50 &&
+                (msg_type == 'A' || msg_type == 'E' || msg_type == 'X' ||
+                    msg_type == 'D' || msg_type == 'U' || msg_type == 'S' || msg_type == 'R')) {
+                    break; 
                 }
-                break;
+                ptr++;
             }
-            
-            // System Event Message
-            case 'S': [[unlikely]]{
-                const auto* msg = reinterpret_cast<const SystemEventMessage*>(buffer);
-                uint16_t stock_locate = bswap16(msg->stock_locate);
-
-                if (VERBOSE) {
-                    uint16_t tracking_num = bswap16(msg->tracking_number);
-                    uint64_t ns = parse_timestamp48(msg->timestamp);
-                    std::cout << "[System Event] "
-                              << "Locate: " << std::setw(5) << stock_locate
-                              << " | Seq: " << std::setw(5) << tracking_num
-                              << " | Time: " << format_timestamp(ns)
-                              << " | Code: " << msg->event_code << "\n";
-                }
-                break;
-            }
-
-            // Add Order Message (No MPID)
-            case 'A': [[likely]] {
-                const auto* msg = reinterpret_cast<const AddOrderMessage*>(buffer);
-                uint16_t stock_locate = bswap16(msg->stock_locate);            
-                uint64_t order_ref = bswap64(msg->order_ref_num);
-                uint32_t shares = bswap32(msg->shares);
-                uint32_t raw_price = bswap32(msg->price);
-                
-                total_volume_traded += shares;
-
-                get_or_create_book(stock_locate)->add_order(order_ref, msg->buy_sell_indicator, shares, raw_price, stock_locate);
-
-                if (VERBOSE) {
-                    uint16_t tracking_num = bswap16(msg->tracking_number);
-                    uint64_t ns = parse_timestamp48(msg->timestamp);
-                    double price = raw_price / 10000.0;
-                    std::string symbol = clean_symbol(msg->stock, 8);
-                    std::cout << "[Add Order]    "
-                              << "Locate: " << std::setw(5) << stock_locate
-                              << " | Seq: " << std::setw(5) << tracking_num
-                              << " | Time: " << format_timestamp(ns)
-                              << " | Ref#: " << std::setw(10) << order_ref
-                              << " | Side: " << msg->buy_sell_indicator
-                              << " | Shares: " << std::setw(5) << shares
-                              << " | Stock: " << std::setw(8) << symbol
-                              << " | Price: $" << std::fixed << std::setprecision(4) << price << "\n";
-                }
-                break;
-            }
-
-            // Order Executed Message
-            case 'E': [[likely]] {
-                const auto* msg = reinterpret_cast<const OrderExecutedMessage*>(buffer);
-                uint16_t stock_locate = bswap16(msg->stock_locate);
-                uint64_t order_ref = bswap64(msg->order_ref_num);
-                uint32_t exec_shares = bswap32(msg->executed_shares);
-                uint64_t match_num = bswap64(msg->match_number);
-                total_volume_traded += exec_shares;
-
-                get_or_create_book(stock_locate)->execute_order(order_ref, exec_shares);
-
-                if (VERBOSE) {
-                    uint16_t tracking_num = bswap16(msg->tracking_number);
-                    uint64_t ns = parse_timestamp48(msg->timestamp);
-                    std::cout << "[Executed]     "
-                              << "Locate: " << std::setw(5) << stock_locate
-                              << " | Seq: " << std::setw(5) << tracking_num
-                              << " | Time: " << format_timestamp(ns)
-                              << " | Ref#: " << std::setw(10) << order_ref
-                              << " | ExecShares: " << std::setw(5) << exec_shares
-                              << " | Stock: " << std::setw(8) << symbol_map[stock_locate]
-                              << " | Match#: " << match_num << "\n";
-                }
-                break;
-            }
-
-            // Order Cancel Message
-            case 'X': [[likely]] {
-                const auto* msg = reinterpret_cast<const OrderCancelMessage*>(buffer);
-                uint16_t stock_locate = bswap16(msg->stock_locate);
-                uint64_t order_ref = bswap64(msg->order_ref_num);
-                uint32_t cancel_shares = bswap32(msg->cancelled_shares);
-
-                get_or_create_book(stock_locate)->cancel_order(order_ref, cancel_shares);
-
-                if (VERBOSE) {
-                    uint16_t tracking_num = bswap16(msg->tracking_number);
-                    uint64_t ns = parse_timestamp48(msg->timestamp);
-                    std::cout << "[Cancel]       "
-                              << "Locate: " << std::setw(5) << stock_locate
-                              << " | Seq: " << std::setw(5) << tracking_num
-                              << " | Time: " << format_timestamp(ns)
-                              << " | Ref#: " << std::setw(10) << order_ref
-                              << " | CancelShares: " << std::setw(5) << cancel_shares
-                              << " | Stock: " << std::setw(8) << symbol_map[stock_locate] << "\n";
-                }
-                break;
-            }
-
-            // Order Delete Message
-            case 'D': [[likely]] {
-                const auto* msg = reinterpret_cast<const OrderDeleteMessage*>(buffer);
-                uint16_t stock_locate = bswap16(msg->stock_locate);
-                uint64_t order_ref = bswap64(msg->order_ref_num);
-
-                get_or_create_book(stock_locate)->delete_order(order_ref);
-
-                if (VERBOSE) {
-                    uint16_t tracking_num = bswap16(msg->tracking_number);
-                    uint64_t ns = parse_timestamp48(msg->timestamp);
-                    std::cout << "[Delete]       "
-                              << "Locate: " << std::setw(5) << stock_locate
-                              << " | Seq: " << std::setw(5) << tracking_num
-                              << " | Time: " << format_timestamp(ns)
-                              << " | Ref#: " << std::setw(10) << order_ref
-                              << " | Stock: " << std::setw(8) << symbol_map[stock_locate] << "\n";
-                }
-                break;
-            }
-
-            // Order Replace Message
-            case 'U': [[likely]] {
-                const auto* msg = reinterpret_cast<const OrderReplaceMessage*>(buffer);
-                uint16_t stock_locate = bswap16(msg->stock_locate);
-                uint64_t orig_ref = bswap64(msg->original_order_ref_num);
-                uint64_t new_ref = bswap64(msg->new_order_ref_num);
-                uint32_t shares = bswap32(msg->shares);
-                uint32_t raw_price = bswap32(msg->price);
-                
-
-                get_or_create_book(stock_locate)->replace_order(orig_ref, new_ref, shares, raw_price);
-
-                if (VERBOSE) {
-                    double price = raw_price / 10000.0;
-                    uint16_t tracking_num = bswap16(msg->tracking_number);
-                    uint64_t ns = parse_timestamp48(msg->timestamp);
-                    std::cout << "[Replace]      "
-                              << "Locate: " << std::setw(5) << stock_locate
-                              << " | Seq: " << std::setw(5) << tracking_num
-                              << " | Time: " << format_timestamp(ns)
-                              << " | OrigRef#: " << std::setw(10) << orig_ref
-                              << " | NewRef#: " << std::setw(10) << new_ref
-                              << " | Shares: " << std::setw(5) << shares
-                              << " | Stock: " << std::setw(8) << symbol_map[stock_locate]
-                              << " | NewPrice: $" << std::fixed << std::setprecision(4) << price << "\n";
-                }
-                break;
-            }
-
-            default:
-                break;
         }
-        ptr += msg_length;
+
+        while (ptr + 2 < end_ptr) {
+            uint16_t raw_length = 0;
+            std::memcpy(&raw_length, ptr, sizeof(raw_length));
+            uint16_t msg_length = bswap16(raw_length);
+            ptr += 2;
+
+            if(msg_length == 0 || ptr + msg_length > total_file_end) break;
+
+            // Zero copy pointer directly into mapped memory
+            const char* buffer = reinterpret_cast<const char*>(ptr);
+            char message_type = buffer[0];
+
+            #pragma omp atomic
+            processed_count++;
+
+
+                switch (message_type) {
+
+                    // Stock Directory Message
+                    case 'R': [[unlikely]] {
+                        const auto* msg = reinterpret_cast<const StockDirectoryMessage*>(buffer);
+                        uint16_t locate = bswap16(msg->stock_locate);
+                        std::memcpy(symbol_map[locate], msg->stock, 8);
+                        symbol_map[locate][8] = '\0'; // Null-terminate for string safety
+
+                        if (VERBOSE) {
+                            uint32_t lot_size = bswap32(msg->round_lot_size);
+                            std::cout << "[Stock Directory] Locate: " << std::setw(5) << locate
+                                    << " | Symbol: " << std::setw(8) << symbol_map[locate]
+                                    << " | Lot Size: " << lot_size << "\n";
+                        }
+                        break;
+                    }
+                    
+                    // System Event Message
+                    case 'S': [[unlikely]]{
+                        const auto* msg = reinterpret_cast<const SystemEventMessage*>(buffer);
+                        uint16_t stock_locate = bswap16(msg->stock_locate);
+
+                        if (VERBOSE) {
+                            uint16_t tracking_num = bswap16(msg->tracking_number);
+                            uint64_t ns = parse_timestamp48(msg->timestamp);
+                            std::cout << "[System Event] "
+                                    << "Locate: " << std::setw(5) << stock_locate
+                                    << " | Seq: " << std::setw(5) << tracking_num
+                                    << " | Time: " << format_timestamp(ns)
+                                    << " | Code: " << msg->event_code << "\n";
+                        }
+                        break;
+                    }
+
+                    // Add Order Message (No MPID)
+                    case 'A': [[likely]] {
+                        const auto* msg = reinterpret_cast<const AddOrderMessage*>(buffer);
+                        uint16_t stock_locate = bswap16(msg->stock_locate);            
+                        uint64_t order_ref = bswap64(msg->order_ref_num);
+                        uint32_t shares = bswap32(msg->shares);
+                        uint32_t raw_price = bswap32(msg->price);
+                        
+                        #pragma omp atomic
+                        total_volume_traded += shares;
+
+                        get_or_create_book(stock_locate)->add_order(order_ref, msg->buy_sell_indicator, shares, raw_price, stock_locate);
+
+                        if (VERBOSE) {
+                            uint16_t tracking_num = bswap16(msg->tracking_number);
+                            uint64_t ns = parse_timestamp48(msg->timestamp);
+                            double price = raw_price / 10000.0;
+                            std::string symbol = clean_symbol(msg->stock, 8);
+                            std::cout << "[Add Order]    "
+                                    << "Locate: " << std::setw(5) << stock_locate
+                                    << " | Seq: " << std::setw(5) << tracking_num
+                                    << " | Time: " << format_timestamp(ns)
+                                    << " | Ref#: " << std::setw(10) << order_ref
+                                    << " | Side: " << msg->buy_sell_indicator
+                                    << " | Shares: " << std::setw(5) << shares
+                                    << " | Stock: " << std::setw(8) << symbol
+                                    << " | Price: $" << std::fixed << std::setprecision(4) << price << "\n";
+                        }
+                        break;
+                    }
+
+                    // Order Executed Message
+                    case 'E': [[likely]] {
+                        const auto* msg = reinterpret_cast<const OrderExecutedMessage*>(buffer);
+                        uint16_t stock_locate = bswap16(msg->stock_locate);
+                        uint64_t order_ref = bswap64(msg->order_ref_num);
+                        uint32_t exec_shares = bswap32(msg->executed_shares);
+                        uint64_t match_num = bswap64(msg->match_number);
+                        #pragma omp atomic
+                        total_volume_traded += exec_shares;
+
+                        get_or_create_book(stock_locate)->execute_order(order_ref, exec_shares);
+
+                        if (VERBOSE) {
+                            uint16_t tracking_num = bswap16(msg->tracking_number);
+                            uint64_t ns = parse_timestamp48(msg->timestamp);
+                            std::cout << "[Executed]     "
+                                    << "Locate: " << std::setw(5) << stock_locate
+                                    << " | Seq: " << std::setw(5) << tracking_num
+                                    << " | Time: " << format_timestamp(ns)
+                                    << " | Ref#: " << std::setw(10) << order_ref
+                                    << " | ExecShares: " << std::setw(5) << exec_shares
+                                    << " | Stock: " << std::setw(8) << symbol_map[stock_locate]
+                                    << " | Match#: " << match_num << "\n";
+                        }
+                        break;
+                    }
+
+                    // Order Cancel Message
+                    case 'X': [[likely]] {
+                        const auto* msg = reinterpret_cast<const OrderCancelMessage*>(buffer);
+                        uint16_t stock_locate = bswap16(msg->stock_locate);
+                        uint64_t order_ref = bswap64(msg->order_ref_num);
+                        uint32_t cancel_shares = bswap32(msg->cancelled_shares);
+
+                        get_or_create_book(stock_locate)->cancel_order(order_ref, cancel_shares);
+
+                        if (VERBOSE) {
+                            uint16_t tracking_num = bswap16(msg->tracking_number);
+                            uint64_t ns = parse_timestamp48(msg->timestamp);
+                            std::cout << "[Cancel]       "
+                                    << "Locate: " << std::setw(5) << stock_locate
+                                    << " | Seq: " << std::setw(5) << tracking_num
+                                    << " | Time: " << format_timestamp(ns)
+                                    << " | Ref#: " << std::setw(10) << order_ref
+                                    << " | CancelShares: " << std::setw(5) << cancel_shares
+                                    << " | Stock: " << std::setw(8) << symbol_map[stock_locate] << "\n";
+                        }
+                        break;
+                    }
+
+                    // Order Delete Message
+                    case 'D': [[likely]] {
+                        const auto* msg = reinterpret_cast<const OrderDeleteMessage*>(buffer);
+                        uint16_t stock_locate = bswap16(msg->stock_locate);
+                        uint64_t order_ref = bswap64(msg->order_ref_num);
+
+                        get_or_create_book(stock_locate)->delete_order(order_ref);
+
+                        if (VERBOSE) {
+                            uint16_t tracking_num = bswap16(msg->tracking_number);
+                            uint64_t ns = parse_timestamp48(msg->timestamp);
+                            std::cout << "[Delete]       "
+                                    << "Locate: " << std::setw(5) << stock_locate
+                                    << " | Seq: " << std::setw(5) << tracking_num
+                                    << " | Time: " << format_timestamp(ns)
+                                    << " | Ref#: " << std::setw(10) << order_ref
+                                    << " | Stock: " << std::setw(8) << symbol_map[stock_locate] << "\n";
+                        }
+                        break;
+                    }
+
+                    // Order Replace Message
+                    case 'U': [[likely]] {
+                        const auto* msg = reinterpret_cast<const OrderReplaceMessage*>(buffer);
+                        uint16_t stock_locate = bswap16(msg->stock_locate);
+                        uint64_t orig_ref = bswap64(msg->original_order_ref_num);
+                        uint64_t new_ref = bswap64(msg->new_order_ref_num);
+                        uint32_t shares = bswap32(msg->shares);
+                        uint32_t raw_price = bswap32(msg->price);
+                        
+
+                        get_or_create_book(stock_locate)->replace_order(orig_ref, new_ref, shares, raw_price);
+
+                        if (VERBOSE) {
+                            double price = raw_price / 10000.0;
+                            uint16_t tracking_num = bswap16(msg->tracking_number);
+                            uint64_t ns = parse_timestamp48(msg->timestamp);
+                            std::cout << "[Replace]      "
+                                    << "Locate: " << std::setw(5) << stock_locate
+                                    << " | Seq: " << std::setw(5) << tracking_num
+                                    << " | Time: " << format_timestamp(ns)
+                                    << " | OrigRef#: " << std::setw(10) << orig_ref
+                                    << " | NewRef#: " << std::setw(10) << new_ref
+                                    << " | Shares: " << std::setw(5) << shares
+                                    << " | Stock: " << std::setw(8) << symbol_map[stock_locate]
+                                    << " | NewPrice: $" << std::fixed << std::setprecision(4) << price << "\n";
+                        }
+                        break;
+                    }
+
+                    default:
+                        break;
+            }
+
+            ptr += msg_length;
+        }
     }
+    // Loop and read the 2-byte length prefix until EOF
+    
 
     auto end_time = std::chrono::high_resolution_clock::now();
     double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
